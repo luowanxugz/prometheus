@@ -206,6 +206,20 @@ func (t *Target) SetScrapeConfig(scrapeConfig *config.ScrapeConfig, tLabels, tgL
 	t.tgLabels = tgLabels
 }
 
+// SetLabels updates the target's labels.
+func (t *Target) SetLabels(lset labels.Labels) {
+	t.mtx.Lock()
+	defer t.mtx.Unlock()
+	t.labels = lset
+}
+
+// RawLabels returns the full label set including internal labels.
+func (t *Target) RawLabels() labels.Labels {
+	t.mtx.RLock()
+	defer t.mtx.RUnlock()
+	return t.labels
+}
+
 // URL returns a copy of the target's URL.
 func (t *Target) URL() *url.URL {
 	t.mtx.RLock()

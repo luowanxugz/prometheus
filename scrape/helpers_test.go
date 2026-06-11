@@ -94,8 +94,11 @@ func newTestScrapeLoop(t testing.TB, opts ...func(sl *scrapeLoop)) (_ *scrapeLoo
 		l:     promslog.NewNopLogger(),
 		cache: newScrapeCache(metrics),
 
-		interval:            10 * time.Millisecond,
-		timeout:             1 * time.Hour,
+		interval:        10 * time.Millisecond,
+		timeout:         1 * time.Hour,
+		intervalChanged: make(chan struct{}, 1),
+		globalInterval:  10 * time.Millisecond,
+		globalTimeout:   1 * time.Hour,
 		sampleMutator:       nopMutator,
 		reportSampleMutator: nopMutator,
 		buffers:             pool.New(1e3, 1e6, 3, func(sz int) any { return make([]byte, 0, sz) }),

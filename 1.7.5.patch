@@ -1,0 +1,256 @@
+diff --git a/scrape/helpers_test.go b/scrape/helpers_test.go
+index 8d3e8f74e..d609a1ff4 100644
+--- a/scrape/helpers_test.go
++++ b/scrape/helpers_test.go
+@@ -94,8 +94,11 @@ func newTestScrapeLoop(t testing.TB, opts ...func(sl *scrapeLoop)) (_ *scrapeLoo
+ 		l:     promslog.NewNopLogger(),
+ 		cache: newScrapeCache(metrics),
+ 
+-		interval:            10 * time.Millisecond,
+-		timeout:             1 * time.Hour,
++		interval:        10 * time.Millisecond,
++		timeout:         1 * time.Hour,
++		intervalChanged: make(chan struct{}, 1),
++		globalInterval:  10 * time.Millisecond,
++		globalTimeout:   1 * time.Hour,
+ 		sampleMutator:       nopMutator,
+ 		reportSampleMutator: nopMutator,
+ 		buffers:             pool.New(1e3, 1e6, 3, func(sz int) any { return make([]byte, 0, sz) }),
+diff --git a/scrape/scrape.go b/scrape/scrape.go
+index e36ed1a05..95913e21c 100644
+--- a/scrape/scrape.go
++++ b/scrape/scrape.go
+@@ -489,6 +489,10 @@ func (sp *scrapePool) sync(targets []*Target) {
+ 			// Need to keep the most updated ScrapeConfig for
+ 			// displaying labels in the Service Discovery web page.
+ 			sp.activeTargets[hash].SetScrapeConfig(sp.config, t.tLabels, t.tgLabels)
++			sp.activeTargets[hash].SetLabels(t.RawLabels())
++			if l, ok := sp.loops[hash].(*scrapeLoop); ok {
++				l.notifyIntervalChange()
++			}
+ 		}
+ 	}
+ 
+@@ -843,6 +847,11 @@ type scrapeLoop struct {
+ 
+ 	interval            time.Duration
+ 	timeout             time.Duration
++	intervalMtx         sync.RWMutex
++	intervalChanged     chan struct{}
++	globalInterval      time.Duration
++	globalTimeout       time.Duration
++	target              *Target
+ 	sampleMutator       labelsMutator
+ 	reportSampleMutator labelsMutator
+ 	scraper             scraper
+@@ -1189,8 +1198,12 @@ func newScrapeLoop(opts scrapeLoopOptions) *scrapeLoop {
+ 		l:           opts.sp.logger.With("target", opts.target),
+ 		cache:       opts.cache,
+ 
+-		interval: opts.interval,
+-		timeout:  opts.timeout,
++		interval:        opts.interval,
++		timeout:         opts.timeout,
++		intervalChanged: make(chan struct{}, 1),
++		globalInterval:  time.Duration(opts.sp.config.ScrapeInterval),
++		globalTimeout:   time.Duration(opts.sp.config.ScrapeTimeout),
++		target:          opts.target,
+ 		sampleMutator: func(l labels.Labels) labels.Labels {
+ 			return mutateSampleLabels(l, opts.target, opts.sp.config.HonorLabels, opts.sp.config.MetricRelabelConfigs)
+ 		},
+@@ -1253,7 +1266,10 @@ func (sl *scrapeLoop) setScrapeFailureLogger(l FailureLogger) {
+ }
+ 
+ func (sl *scrapeLoop) getScrapeOffset() time.Duration {
+-	offset := sl.scraper.offset(sl.interval, sl.offsetSeed)
++	sl.intervalMtx.RLock()
++	interval := sl.interval
++	sl.intervalMtx.RUnlock()
++	offset := sl.scraper.offset(interval, sl.offsetSeed)
+ 	if sl.skipJitterOffsetting {
+ 		offset = time.Duration(0)
+ 	}
+@@ -1262,37 +1278,40 @@ func (sl *scrapeLoop) getScrapeOffset() time.Duration {
+ 
+ func (sl *scrapeLoop) run(errc chan<- error) {
+ 	var (
+-		last   time.Time
+-		ticker = time.NewTicker(sl.interval)
++		last             time.Time
++		ticker           = time.NewTicker(sl.interval)
++		alignedScrapeTime = time.Now().Round(0)
+ 	)
+ 	defer func() {
+ 		if sl.scrapeOnShutdown {
+ 			last = sl.scrapeAndReport(last, time.Now().Round(0), errc)
+ 		}
+-		// Let the stop() know it can continue.
+ 		close(sl.stopped)
+ 		if sl.parentCtx.Err() == nil {
+ 			if !sl.disabledEndOfRunStalenessMarkers.Load() {
+-				sl.endOfRunStaleness(last, ticker, sl.interval)
++				sl.intervalMtx.RLock()
++				interval := sl.interval
++				sl.intervalMtx.RUnlock()
++				sl.endOfRunStaleness(last, ticker, interval)
+ 			}
+ 		}
+ 		ticker.Stop()
+ 	}()
+ 
+-	// Initial offset and jitter offset, if any.
+ 	offset := sl.getScrapeOffset()
+ 	if offset > 0 {
+ 		select {
+ 		case <-time.After(offset):
+-			// Continue after a scraping offset.
+ 		case <-sl.ctx.Done():
+ 			return
+ 		}
+ 	}
+ 
+-	// Reset the ticker so target scrape times are aligned to the offset+intervals.
+-	ticker.Reset(sl.interval)
+-	alignedScrapeTime := time.Now().Round(0)
++	sl.intervalMtx.RLock()
++	currentInterval := sl.interval
++	sl.intervalMtx.RUnlock()
++	ticker.Reset(currentInterval)
++	alignedScrapeTime = time.Now().Round(0)
+ 
+ 	for {
+ 		select {
+@@ -1301,21 +1320,16 @@ func (sl *scrapeLoop) run(errc chan<- error) {
+ 		default:
+ 		}
+ 
+-		// Temporary workaround for a jitter in go timers that causes disk space
+-		// increase in TSDB.
+-		// See https://github.com/prometheus/prometheus/issues/7846
+-		// Calling Round ensures the time used is the wall clock, as otherwise .Sub
+-		// and .Add on time.Time behave differently (see time package docs).
++		sl.intervalMtx.RLock()
++		currentInterval = sl.interval
++		sl.intervalMtx.RUnlock()
++
+ 		scrapeTime := time.Now().Round(0)
+ 		if AlignScrapeTimestamps {
+-			// Tolerance is clamped to maximum 1% of the scrape interval.
+-			tolerance := min(sl.interval/100, ScrapeTimestampTolerance)
+-			// For some reason, a tick might have been skipped, in which case we
+-			// would call alignedScrapeTime.Add(interval) multiple times.
+-			for scrapeTime.Sub(alignedScrapeTime) >= sl.interval {
+-				alignedScrapeTime = alignedScrapeTime.Add(sl.interval)
++			tolerance := min(currentInterval/100, ScrapeTimestampTolerance)
++			for scrapeTime.Sub(alignedScrapeTime) >= currentInterval {
++				alignedScrapeTime = alignedScrapeTime.Add(currentInterval)
+ 			}
+-			// Align the scrape time if we are in the tolerance boundaries.
+ 			if scrapeTime.Sub(alignedScrapeTime) <= tolerance {
+ 				scrapeTime = alignedScrapeTime
+ 			}
+@@ -1326,11 +1340,38 @@ func (sl *scrapeLoop) run(errc chan<- error) {
+ 		select {
+ 		case <-sl.ctx.Done():
+ 			return
++		case <-sl.intervalChanged:
++			sl.intervalMtx.Lock()
++			newInterval, newTimeout, err := sl.target.intervalAndTimeout(sl.globalInterval, sl.globalTimeout)
++			if err != nil || newInterval <= 0 {
++				newInterval = sl.globalInterval
++			}
++			if newTimeout <= 0 {
++				newTimeout = sl.globalTimeout
++			}
++			if newInterval <= 0 {
++				newInterval = sl.interval
++			}
++			if newTimeout <= 0 {
++				newTimeout = sl.timeout
++			}
++			sl.interval = newInterval
++			sl.timeout = newTimeout
++			sl.intervalMtx.Unlock()
++			ticker.Reset(newInterval)
++			alignedScrapeTime = time.Now().Round(0)
+ 		case <-ticker.C:
+ 		}
+ 	}
+ }
+ 
++func (sl *scrapeLoop) notifyIntervalChange() {
++	select {
++	case sl.intervalChanged <- struct{}{}:
++	default:
++	}
++}
++
+ func (sl *scrapeLoop) appender() scrapeLoopAppendAdapter {
+ 	if sl.appendableV2 != nil {
+ 		return &scrapeLoopAppenderV2{scrapeLoop: sl, AppenderV2: sl.appendableV2.AppenderV2(sl.appenderCtx)}
+@@ -1346,12 +1387,16 @@ func (sl *scrapeLoop) appender() scrapeLoopAppendAdapter {
+ func (sl *scrapeLoop) scrapeAndReport(last, appendTime time.Time, errc chan<- error) time.Time {
+ 	start := time.Now()
+ 
+-	// Only record after the first scrape.
++	sl.intervalMtx.RLock()
++	currentInterval := sl.interval
++	currentTimeout := sl.timeout
++	sl.intervalMtx.RUnlock()
++
+ 	if !last.IsZero() {
+-		sl.metrics.targetIntervalLength.WithLabelValues(sl.interval.String()).Observe(
++		sl.metrics.targetIntervalLength.WithLabelValues(currentInterval.String()).Observe(
+ 			time.Since(last).Seconds(),
+ 		)
+-		sl.metrics.targetIntervalLengthHistogram.WithLabelValues(sl.interval.String()).Observe(
++		sl.metrics.targetIntervalLengthHistogram.WithLabelValues(currentInterval.String()).Observe(
+ 			time.Since(last).Seconds(),
+ 		)
+ 	}
+@@ -1404,7 +1449,7 @@ func (sl *scrapeLoop) scrapeAndReport(last, appendTime time.Time, errc chan<- er
+ 	var resp *http.Response
+ 	var b []byte
+ 	var buf *bytes.Buffer
+-	scrapeCtx, cancel := context.WithTimeout(sl.parentCtx, sl.timeout)
++	scrapeCtx, cancel := context.WithTimeout(sl.parentCtx, currentTimeout)
+ 	resp, scrapeErr = sl.scraper.scrape(scrapeCtx)
+ 	if scrapeErr == nil {
+ 		b = sl.buffers.Get(sl.lastScrapeSize).([]byte)
+@@ -2133,7 +2178,10 @@ func (sl *scrapeLoop) report(app scrapeLoopAppendAdapter, start time.Time, durat
+ 		return err
+ 	}
+ 	if sl.reportExtraMetrics {
+-		if err = app.addReportSample(scrapeTimeoutMetric, ts, sl.timeout.Seconds(), b, false); err != nil {
++		sl.intervalMtx.RLock()
++		timeoutSeconds := sl.timeout.Seconds()
++		sl.intervalMtx.RUnlock()
++		if err = app.addReportSample(scrapeTimeoutMetric, ts, timeoutSeconds, b, false); err != nil {
+ 			return err
+ 		}
+ 		if err = app.addReportSample(scrapeSampleLimitMetric, ts, float64(sl.sampleLimit), b, false); err != nil {
+diff --git a/scrape/target.go b/scrape/target.go
+index 1040241bd..d16c368b7 100644
+--- a/scrape/target.go
++++ b/scrape/target.go
+@@ -206,6 +206,20 @@ func (t *Target) SetScrapeConfig(scrapeConfig *config.ScrapeConfig, tLabels, tgL
+ 	t.tgLabels = tgLabels
+ }
+ 
++// SetLabels updates the target's labels.
++func (t *Target) SetLabels(lset labels.Labels) {
++	t.mtx.Lock()
++	defer t.mtx.Unlock()
++	t.labels = lset
++}
++
++// RawLabels returns the full label set including internal labels.
++func (t *Target) RawLabels() labels.Labels {
++	t.mtx.RLock()
++	defer t.mtx.RUnlock()
++	return t.labels
++}
++
+ // URL returns a copy of the target's URL.
+ func (t *Target) URL() *url.URL {
+ 	t.mtx.RLock()
