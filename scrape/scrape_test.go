@@ -7300,30 +7300,106 @@ func testScrapeLoopDisableStalenessMarkerInjection(t *testing.T, appV2 bool) {
 		return ctx.Err()
 	}
 
-	// Start the scrape loop.
 	go func() {
 		sl.run(nil)
 		loopDone.Store(true)
 	}()
 
-	// Wait for some samples to be appended.
 	require.Eventually(t, func() bool {
 		return len(appTest.ResultSamples()) > 2
 	}, 5*time.Second, 100*time.Millisecond, "Scrape loop didn't append any samples.")
 
-	// Disable end of run staleness markers and stop the loop.
 	sl.disableEndOfRunStalenessMarkers()
 	sl.stop()
 	require.Eventually(t, func() bool {
 		return loopDone.Load()
 	}, 5*time.Second, 100*time.Millisecond, "Scrape loop didn't stop.")
 
-	// No stale markers should be appended, since they were disabled.
 	for _, s := range appTest.ResultSamples() {
 		if value.IsStaleNaN(s.V) {
 			t.Fatalf("Got stale NaN samples while end of run staleness is disabled: %x", math.Float64bits(s.V))
 		}
 	}
+}
+
+func TestScrapeLoopRunRefreshesIntervalAndTimeout(t *testing.T) {
+	foreachAppendable(t, func(t *testing.T, appV2 bool) {
+		ctx, cancel := context.WithCancel(t.Context())
+		appTest := teststorage.NewAppendable()
+		sl, scraper := newTestScrapeLoop(t, withCtx(ctx), withAppendable(appTest, appV2))
+		target := &Target{
+			labels: labels.FromStrings(
+				model.SchemeLabel, "http",
+				model.AddressLabel, "127.0.0.1:9090",
+				model.MetricsPathLabel, "/metrics",
+				model.ScrapeIntervalLabel, "20ms",
+				model.ScrapeTimeoutLabel, "10ms",
+			),
+			scrapeConfig: &config.ScrapeConfig{},
+		}
+		sl.target = target
+		sl.globalInterval = 30 * time.Millisecond
+		sl.globalTimeout = 15 * time.Millisecond
+		sl.interval = 20 * time.Millisecond
+		sl.timeout = 10 * time.Millisecond
+		sl.skipJitterOffsetting = true
+
+		setTargetLabels := func(interval, timeout string) {
+			target.mtx.Lock()
+			target.labels = labels.FromStrings(
+				model.SchemeLabel, "http",
+				model.AddressLabel, "127.0.0.1:9090",
+				model.MetricsPathLabel, "/metrics",
+				model.ScrapeIntervalLabel, interval,
+				model.ScrapeTimeoutLabel, timeout,
+			)
+			target.mtx.Unlock()
+		}
+
+		scrapeCount := atomic.NewInt64(0)
+		scraper.scrapeFunc = func(ctx context.Context, w io.Writer) error {
+			if _, err := w.Write([]byte("metric_a 1\n")); err != nil {
+				return err
+			}
+
+			switch scrapeCount.Inc() {
+			case 2:
+				setTargetLabels("5ms", "3ms")
+			case 4:
+				setTargetLabels("0s", "-1s")
+			case 6:
+				cancel()
+			}
+
+			return ctx.Err()
+		}
+
+		done := make(chan struct{})
+		go func() {
+			sl.run(nil)
+			close(done)
+		}()
+
+		require.Eventually(t, func() bool {
+			interval, timeout := sl.getIntervalAndTimeout()
+			return interval == 5*time.Millisecond && timeout == 3*time.Millisecond
+		}, time.Second, 5*time.Millisecond)
+
+		require.Eventually(t, func() bool {
+			interval, timeout := sl.getIntervalAndTimeout()
+			return interval == 30*time.Millisecond && timeout == 15*time.Millisecond
+		}, time.Second, 5*time.Millisecond)
+
+		require.Eventually(t, func() bool {
+			select {
+			case <-done:
+				return true
+			default:
+				return false
+			}
+		}, time.Second, 5*time.Millisecond)
+		require.GreaterOrEqual(t, scrapeCount.Load(), int64(6))
+	})
 }
 
 // Recommended CLI invocation:

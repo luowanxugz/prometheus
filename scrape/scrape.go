@@ -840,12 +840,16 @@ type scrapeLoop struct {
 	appenderCtx context.Context
 	l           *slog.Logger
 	cache       *scrapeCache
+	target      *Target
 
-	interval            time.Duration
-	timeout             time.Duration
-	sampleMutator       labelsMutator
+	globalInterval     time.Duration
+	globalTimeout      time.Duration
+	intervalMtx        sync.RWMutex
+	interval           time.Duration
+	timeout            time.Duration
+	sampleMutator      labelsMutator
 	reportSampleMutator labelsMutator
-	scraper             scraper
+	scraper            scraper
 
 	// Static params per scrapePool.
 	appendable   storage.Appendable
@@ -1188,9 +1192,12 @@ func newScrapeLoop(opts scrapeLoopOptions) *scrapeLoop {
 		appenderCtx: appenderCtx,
 		l:           opts.sp.logger.With("target", opts.target),
 		cache:       opts.cache,
+		target:      opts.target,
 
-		interval: opts.interval,
-		timeout:  opts.timeout,
+		globalInterval: time.Duration(opts.sp.config.ScrapeInterval),
+		globalTimeout:  time.Duration(opts.sp.config.ScrapeTimeout),
+		interval:       opts.interval,
+		timeout:        opts.timeout,
 		sampleMutator: func(l labels.Labels) labels.Labels {
 			return mutateSampleLabels(l, opts.target, opts.sp.config.HonorLabels, opts.sp.config.MetricRelabelConfigs)
 		},
@@ -1252,8 +1259,75 @@ func (sl *scrapeLoop) setScrapeFailureLogger(l FailureLogger) {
 	sl.scrapeFailureLogger = l
 }
 
+func (sl *scrapeLoop) getIntervalAndTimeout() (time.Duration, time.Duration) {
+	sl.intervalMtx.RLock()
+	defer sl.intervalMtx.RUnlock()
+
+	return sl.interval, sl.timeout
+}
+
+func (sl *scrapeLoop) setIntervalAndTimeout(interval, timeout time.Duration) {
+	sl.intervalMtx.Lock()
+	sl.interval = interval
+	sl.timeout = timeout
+	sl.intervalMtx.Unlock()
+
+	if ts, ok := sl.scraper.(*targetScraper); ok {
+		ts.timeout = timeout
+		ts.req = nil
+	}
+}
+
+func (sl *scrapeLoop) normalizeIntervalAndTimeout(interval, timeout time.Duration) (time.Duration, time.Duration) {
+	currentInterval, currentTimeout := sl.getIntervalAndTimeout()
+	if interval <= 0 {
+		switch {
+		case sl.globalInterval > 0:
+			interval = sl.globalInterval
+		case currentInterval > 0:
+			interval = currentInterval
+		default:
+			interval = time.Second
+		}
+	}
+	if timeout <= 0 {
+		switch {
+		case sl.globalTimeout > 0:
+			timeout = sl.globalTimeout
+		case currentTimeout > 0:
+			timeout = currentTimeout
+		default:
+			timeout = interval
+		}
+	}
+	if timeout <= 0 {
+		timeout = interval
+	}
+	return interval, timeout
+}
+
+func (sl *scrapeLoop) refreshIntervalAndTimeout() (time.Duration, time.Duration, bool) {
+	currentInterval, currentTimeout := sl.getIntervalAndTimeout()
+	interval, timeout := currentInterval, currentTimeout
+	if sl.target != nil {
+		var err error
+		interval, timeout, err = sl.target.intervalAndTimeout(sl.globalInterval, sl.globalTimeout)
+		if err != nil {
+			sl.l.Warn("Failed to refresh scrape interval or timeout", "err", err)
+			interval, timeout = currentInterval, currentTimeout
+		}
+	}
+	interval, timeout = sl.normalizeIntervalAndTimeout(interval, timeout)
+	changed := interval != currentInterval || timeout != currentTimeout
+	if changed {
+		sl.setIntervalAndTimeout(interval, timeout)
+	}
+	return interval, timeout, changed
+}
+
 func (sl *scrapeLoop) getScrapeOffset() time.Duration {
-	offset := sl.scraper.offset(sl.interval, sl.offsetSeed)
+	interval, _ := sl.getIntervalAndTimeout()
+	offset := sl.scraper.offset(interval, sl.offsetSeed)
 	if sl.skipJitterOffsetting {
 		offset = time.Duration(0)
 	}
@@ -1261,37 +1335,36 @@ func (sl *scrapeLoop) getScrapeOffset() time.Duration {
 }
 
 func (sl *scrapeLoop) run(errc chan<- error) {
+	interval, _, _ := sl.refreshIntervalAndTimeout()
 	var (
 		last   time.Time
-		ticker = time.NewTicker(sl.interval)
+		ticker = time.NewTicker(interval)
 	)
 	defer func() {
 		if sl.scrapeOnShutdown {
 			last = sl.scrapeAndReport(last, time.Now().Round(0), errc)
 		}
-		// Let the stop() know it can continue.
 		close(sl.stopped)
 		if sl.parentCtx.Err() == nil {
 			if !sl.disabledEndOfRunStalenessMarkers.Load() {
-				sl.endOfRunStaleness(last, ticker, sl.interval)
+				currentInterval, _ := sl.getIntervalAndTimeout()
+				sl.endOfRunStaleness(last, ticker, currentInterval)
 			}
 		}
 		ticker.Stop()
 	}()
 
-	// Initial offset and jitter offset, if any.
 	offset := sl.getScrapeOffset()
 	if offset > 0 {
 		select {
 		case <-time.After(offset):
-			// Continue after a scraping offset.
 		case <-sl.ctx.Done():
 			return
 		}
 	}
 
-	// Reset the ticker so target scrape times are aligned to the offset+intervals.
-	ticker.Reset(sl.interval)
+	interval, _, _ = sl.refreshIntervalAndTimeout()
+	ticker.Reset(interval)
 	alignedScrapeTime := time.Now().Round(0)
 
 	for {
@@ -1301,27 +1374,38 @@ func (sl *scrapeLoop) run(errc chan<- error) {
 		default:
 		}
 
-		// Temporary workaround for a jitter in go timers that causes disk space
-		// increase in TSDB.
-		// See https://github.com/prometheus/prometheus/issues/7846
-		// Calling Round ensures the time used is the wall clock, as otherwise .Sub
-		// and .Add on time.Time behave differently (see time package docs).
+		interval, _, changed := sl.refreshIntervalAndTimeout()
+		if changed {
+			select {
+			case <-ticker.C:
+			default:
+			}
+			ticker.Reset(interval)
+			alignedScrapeTime = time.Now().Round(0)
+		}
+
 		scrapeTime := time.Now().Round(0)
 		if AlignScrapeTimestamps {
-			// Tolerance is clamped to maximum 1% of the scrape interval.
-			tolerance := min(sl.interval/100, ScrapeTimestampTolerance)
-			// For some reason, a tick might have been skipped, in which case we
-			// would call alignedScrapeTime.Add(interval) multiple times.
-			for scrapeTime.Sub(alignedScrapeTime) >= sl.interval {
-				alignedScrapeTime = alignedScrapeTime.Add(sl.interval)
+			tolerance := min(interval/100, ScrapeTimestampTolerance)
+			for scrapeTime.Sub(alignedScrapeTime) >= interval {
+				alignedScrapeTime = alignedScrapeTime.Add(interval)
 			}
-			// Align the scrape time if we are in the tolerance boundaries.
 			if scrapeTime.Sub(alignedScrapeTime) <= tolerance {
 				scrapeTime = alignedScrapeTime
 			}
 		}
 
 		last = sl.scrapeAndReport(last, scrapeTime, errc)
+
+		interval, _, changed = sl.refreshIntervalAndTimeout()
+		if changed {
+			select {
+			case <-ticker.C:
+			default:
+			}
+			ticker.Reset(interval)
+			alignedScrapeTime = time.Now().Round(0)
+		}
 
 		select {
 		case <-sl.ctx.Done():
@@ -1345,13 +1429,13 @@ func (sl *scrapeLoop) appender() scrapeLoopAppendAdapter {
 // only be cancelled on shutdown, not on reloads.
 func (sl *scrapeLoop) scrapeAndReport(last, appendTime time.Time, errc chan<- error) time.Time {
 	start := time.Now()
+	interval, timeout := sl.getIntervalAndTimeout()
 
-	// Only record after the first scrape.
 	if !last.IsZero() {
-		sl.metrics.targetIntervalLength.WithLabelValues(sl.interval.String()).Observe(
+		sl.metrics.targetIntervalLength.WithLabelValues(interval.String()).Observe(
 			time.Since(last).Seconds(),
 		)
-		sl.metrics.targetIntervalLengthHistogram.WithLabelValues(sl.interval.String()).Observe(
+		sl.metrics.targetIntervalLengthHistogram.WithLabelValues(interval.String()).Observe(
 			time.Since(last).Seconds(),
 		)
 	}
@@ -1404,7 +1488,7 @@ func (sl *scrapeLoop) scrapeAndReport(last, appendTime time.Time, errc chan<- er
 	var resp *http.Response
 	var b []byte
 	var buf *bytes.Buffer
-	scrapeCtx, cancel := context.WithTimeout(sl.parentCtx, sl.timeout)
+	scrapeCtx, cancel := context.WithTimeout(sl.parentCtx, timeout)
 	resp, scrapeErr = sl.scraper.scrape(scrapeCtx)
 	if scrapeErr == nil {
 		b = sl.buffers.Get(sl.lastScrapeSize).([]byte)
@@ -2133,7 +2217,8 @@ func (sl *scrapeLoop) report(app scrapeLoopAppendAdapter, start time.Time, durat
 		return err
 	}
 	if sl.reportExtraMetrics {
-		if err = app.addReportSample(scrapeTimeoutMetric, ts, sl.timeout.Seconds(), b, false); err != nil {
+		_, timeout := sl.getIntervalAndTimeout()
+		if err = app.addReportSample(scrapeTimeoutMetric, ts, timeout.Seconds(), b, false); err != nil {
 			return err
 		}
 		if err = app.addReportSample(scrapeSampleLimitMetric, ts, float64(sl.sampleLimit), b, false); err != nil {
