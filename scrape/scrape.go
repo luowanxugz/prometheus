@@ -1301,6 +1301,33 @@ func (sl *scrapeLoop) run(errc chan<- error) {
 		default:
 		}
 
+		// 动态获取 scrape_interval 和 scrape_timeout
+		if ts, ok := sl.scraper.(*targetScraper); ok {
+			// ts.intervalAndTimeout 内部有 target.mtx.RLock()，保证并发安全
+			newInterval, newTimeout, _ := ts.intervalAndTimeout(sl.interval, sl.timeout)
+			
+			// 处理0或负数边界，若不合法则降级使用当前的合法值
+			if newInterval <= 0 {
+				newInterval = sl.interval
+			}
+			if newTimeout <= 0 {
+				newTimeout = sl.timeout
+			}
+
+			// 如果 interval 发生变化，更新状态，重置 ticker 并对齐时间
+			if newInterval != sl.interval {
+				sl.interval = newInterval
+				ticker.Reset(sl.interval)
+				alignedScrapeTime = time.Now().Round(0)
+			}
+			
+			// 如果 timeout 发生变化，更新 sl.timeout 以及 targetScraper 内部的 timeout
+			if newTimeout != sl.timeout {
+				sl.timeout = newTimeout
+				ts.timeout = newTimeout
+			}
+		}
+
 		// Temporary workaround for a jitter in go timers that causes disk space
 		// increase in TSDB.
 		// See https://github.com/prometheus/prometheus/issues/7846
