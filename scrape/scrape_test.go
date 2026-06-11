@@ -450,6 +450,9 @@ type testLoop struct {
 func (*testLoop) setScrapeFailureLogger(FailureLogger) {
 }
 
+func (*testLoop) notifyIntervalChange() {
+}
+
 func (l *testLoop) run(errc chan<- error) {
 	if l.runOnce {
 		panic("loop must be started only once")

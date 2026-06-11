@@ -206,6 +206,22 @@ func (t *Target) SetScrapeConfig(scrapeConfig *config.ScrapeConfig, tLabels, tgL
 	t.tgLabels = tgLabels
 }
 
+// SyncLabels re-populates the target's labels from its stored ScrapeConfig
+// and label sets. It can be called after SetScrapeConfig to pick up label
+// changes from service discovery (e.g. K8s ConfigMap updates).
+func (t *Target) SyncLabels() error {
+	t.mtx.Lock()
+	defer t.mtx.Unlock()
+
+	var lb labels.Builder
+	res, err := PopulateLabels(&lb, t.scrapeConfig, t.tLabels, t.tgLabels)
+	if err != nil {
+		return err
+	}
+	t.labels = res
+	return nil
+}
+
 // URL returns a copy of the target's URL.
 func (t *Target) URL() *url.URL {
 	t.mtx.RLock()
