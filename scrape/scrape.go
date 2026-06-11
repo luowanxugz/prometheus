@@ -747,11 +747,23 @@ func (s *targetScraper) scrape(ctx context.Context) (*http.Response, error) {
 		req.Header.Set("X-Prometheus-Scrape-Timeout-Seconds", strconv.FormatFloat(s.timeout.Seconds(), 'f', -1, 64))
 
 		s.req = req
+	} else {
+		// The timeout is refreshed on every scrape so peers observe the
+		// latest dynamic __scrape_timeout__ value.
+		s.req.Header.Set("X-Prometheus-Scrape-Timeout-Seconds", strconv.FormatFloat(s.timeout.Seconds(), 'f', -1, 64))
 	}
 	ctx, span := otel.Tracer("").Start(ctx, "Scrape", trace.WithSpanKind(trace.SpanKindClient))
 	defer span.End()
 
 	return s.client.Do(s.req.WithContext(ctx))
+}
+
+// setTimeout updates the per-scrape HTTP timeout advertised to the target.
+// It is safe to call from any goroutine concurrently with scrape().
+// The actual HTTP request is serialized by the single run() goroutine, so
+// we do not need to coordinate concurrent header mutation.
+func (s *targetScraper) setTimeout(t time.Duration) {
+	s.timeout = t
 }
 
 func (s *targetScraper) readResponse(_ context.Context, resp *http.Response, w io.Writer) (string, error) {
@@ -846,6 +858,24 @@ type scrapeLoop struct {
 	sampleMutator       labelsMutator
 	reportSampleMutator labelsMutator
 	scraper             scraper
+	target              *Target
+
+	// globalInterval/globalTimeout are the fallback values used when the
+	// dynamic __scrape_interval__/__scrape_timeout__ labels are missing,
+	// empty, invalid or resolve to a non-positive duration.
+	globalInterval time.Duration
+	globalTimeout  time.Duration
+
+	// intervalMtx protects reads and writes to sl.interval / sl.timeout
+	// from non-run() goroutines (e.g. external ReloadInterval() calls).
+	// run() itself is the single writer mutating these fields under the
+	// lock; other goroutines only trigger the intervalChanged signal.
+	intervalMtx sync.RWMutex
+
+	// intervalChanged is a non-blocking signal used to tell run() that
+	// the target labels (and therefore the interval/timeout) may have
+	// changed and should be re-read.
+	intervalChanged chan struct{}
 
 	// Static params per scrapePool.
 	appendable   storage.Appendable
@@ -1189,13 +1219,17 @@ func newScrapeLoop(opts scrapeLoopOptions) *scrapeLoop {
 		l:           opts.sp.logger.With("target", opts.target),
 		cache:       opts.cache,
 
-		interval: opts.interval,
-		timeout:  opts.timeout,
+		interval:        opts.interval,
+		timeout:         opts.timeout,
+		globalInterval:  time.Duration(opts.sp.config.ScrapeInterval),
+		globalTimeout:   time.Duration(opts.sp.config.ScrapeTimeout),
+		intervalChanged: make(chan struct{}, 1),
 		sampleMutator: func(l labels.Labels) labels.Labels {
 			return mutateSampleLabels(l, opts.target, opts.sp.config.HonorLabels, opts.sp.config.MetricRelabelConfigs)
 		},
 		reportSampleMutator: func(l labels.Labels) labels.Labels { return mutateReportSampleLabels(l, opts.target) },
 		scraper:             opts.scraper,
+		target:              opts.target,
 
 		// Static params per scrapePool.
 		appendable:   opts.sp.appendable,
@@ -1260,6 +1294,64 @@ func (sl *scrapeLoop) getScrapeOffset() time.Duration {
 	return sl.initialScrapeOffset + offset
 }
 
+// reloadInterval reads fresh __scrape_interval__ / __scrape_timeout__ labels
+// from the target and updates sl.interval / sl.timeout under intervalMtx.
+// It returns the freshly clamped interval value. Any invalid / non-positive
+// label value falls back to the global defaults set at scrapeLoop creation.
+func (sl *scrapeLoop) reloadInterval() time.Duration {
+	newInterval, newTimeout, err := sl.target.intervalAndTimeout(sl.globalInterval, sl.globalTimeout)
+	if err != nil {
+		sl.l.Warn("Failed to parse dynamic scrape interval label, falling back to global defaults", "err", err)
+		newInterval = sl.globalInterval
+		newTimeout = sl.globalTimeout
+	}
+	// Boundary handling: non-positive values are rejected and replaced with
+	// their corresponding global default. This guarantees the ticker always
+	// fires on a valid duration and the scrape timeout is strictly positive.
+	if newInterval <= 0 {
+		sl.l.Warn("Dynamic scrape interval resolved to non-positive value, using global default",
+			"value", newInterval, "fallback", sl.globalInterval)
+		newInterval = sl.globalInterval
+	}
+	if newTimeout <= 0 {
+		sl.l.Warn("Dynamic scrape timeout resolved to non-positive value, using global default",
+			"value", newTimeout, "fallback", sl.globalTimeout)
+		newTimeout = sl.globalTimeout
+	}
+	// Scrape timeout cannot exceed the interval; otherwise a scrape could
+	// still be running when the next one fires.
+	if newTimeout > newInterval {
+		sl.l.Warn("Scrape timeout exceeds interval; clamping to interval",
+			"timeout", newTimeout, "interval", newInterval)
+		newTimeout = newInterval
+	}
+
+	sl.intervalMtx.Lock()
+	sl.interval = newInterval
+	sl.timeout = newTimeout
+	sl.intervalMtx.Unlock()
+
+	// Propagate new timeout into the HTTP scraper so the X-Prometheus-Scrape-Timeout-Seconds
+	// header is refreshed on the next scrape.
+	if ts, ok := sl.scraper.(interface{ setTimeout(time.Duration) }); ok {
+		ts.setTimeout(newTimeout)
+	}
+	return newInterval
+}
+
+// ReloadInterval may be called from outside the run() goroutine (e.g.
+// by scrapePool on a ConfigMap change) to ask the loop to re-read the
+// target's __scrape_interval__ / __scrape_timeout__ labels on its next
+// iteration. The call is non-blocking and idempotent: rapid callers only
+// generate a single re-read cycle.
+func (sl *scrapeLoop) ReloadInterval() {
+	select {
+	case sl.intervalChanged <- struct{}{}:
+	default:
+		// A reload is already pending; there is no need to queue another.
+	}
+}
+
 func (sl *scrapeLoop) run(errc chan<- error) {
 	var (
 		last   time.Time
@@ -1272,8 +1364,11 @@ func (sl *scrapeLoop) run(errc chan<- error) {
 		// Let the stop() know it can continue.
 		close(sl.stopped)
 		if sl.parentCtx.Err() == nil {
+			sl.intervalMtx.RLock()
+			interval := sl.interval
+			sl.intervalMtx.RUnlock()
 			if !sl.disabledEndOfRunStalenessMarkers.Load() {
-				sl.endOfRunStaleness(last, ticker, sl.interval)
+				sl.endOfRunStaleness(last, ticker, interval)
 			}
 		}
 		ticker.Stop()
@@ -1291,7 +1386,10 @@ func (sl *scrapeLoop) run(errc chan<- error) {
 	}
 
 	// Reset the ticker so target scrape times are aligned to the offset+intervals.
-	ticker.Reset(sl.interval)
+	sl.intervalMtx.RLock()
+	interval := sl.interval
+	sl.intervalMtx.RUnlock()
+	ticker.Reset(interval)
 	alignedScrapeTime := time.Now().Round(0)
 
 	for {
@@ -1307,13 +1405,18 @@ func (sl *scrapeLoop) run(errc chan<- error) {
 		// Calling Round ensures the time used is the wall clock, as otherwise .Sub
 		// and .Add on time.Time behave differently (see time package docs).
 		scrapeTime := time.Now().Round(0)
+
+		sl.intervalMtx.RLock()
+		interval = sl.interval
+		sl.intervalMtx.RUnlock()
+
 		if AlignScrapeTimestamps {
 			// Tolerance is clamped to maximum 1% of the scrape interval.
-			tolerance := min(sl.interval/100, ScrapeTimestampTolerance)
+			tolerance := min(interval/100, ScrapeTimestampTolerance)
 			// For some reason, a tick might have been skipped, in which case we
 			// would call alignedScrapeTime.Add(interval) multiple times.
-			for scrapeTime.Sub(alignedScrapeTime) >= sl.interval {
-				alignedScrapeTime = alignedScrapeTime.Add(sl.interval)
+			for scrapeTime.Sub(alignedScrapeTime) >= interval {
+				alignedScrapeTime = alignedScrapeTime.Add(interval)
 			}
 			// Align the scrape time if we are in the tolerance boundaries.
 			if scrapeTime.Sub(alignedScrapeTime) <= tolerance {
@@ -1323,9 +1426,21 @@ func (sl *scrapeLoop) run(errc chan<- error) {
 
 		last = sl.scrapeAndReport(last, scrapeTime, errc)
 
+		// Wait for the next scrape interval, or bail out early on ctx.Done().
+		// intervalChanged may fire multiple times between scrapes; we keep
+		// re-reading the labels and resetting the ticker without performing a
+		// scrape, preserving the alignedScrapeTime reference so the following
+		// scrape fires at a correctly-aligned wall-clock time.
+	wait:
 		select {
 		case <-sl.ctx.Done():
 			return
+		case <-sl.intervalChanged:
+			newInterval := sl.reloadInterval()
+			sl.l.Info("Dynamic scrape interval reloaded",
+				"new_interval", newInterval, "new_timeout", sl.timeout)
+			ticker.Reset(newInterval)
+			goto wait
 		case <-ticker.C:
 		}
 	}
